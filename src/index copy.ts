@@ -14,7 +14,11 @@ Bun.serve({
     port,
     fetch(req) {
         const url = new URL(req.url);
-        if (url.pathname === "/health") return new Response("ok", { status: 200 });
+
+        if (url.pathname === "/health") {
+            return new Response("ok", { status: 200 });
+        }
+
         return new Response("discord bot running", { status: 200 });
     },
 });
@@ -25,10 +29,8 @@ import {
     Client,
     GatewayIntentBits,
     GuildMember,
-    type Message as DjsMessage,
-    type TextBasedChannel,
+    type Message,
 } from "discord.js";
-
 import {
     joinVoiceChannel,
     getVoiceConnection,
@@ -50,14 +52,6 @@ const PREFIX = "!";
 const TOKEN = process.env.DISCORD_TOKEN!;
 if (!TOKEN) throw new Error("Missing DISCORD_TOKEN in .env");
 
-// (Render) ใส่ cookies ผ่าน Secret File: /etc/secrets/youtube_cookies.txt
-const YTDLP_COOKIES_PATH =
-    process.env.YTDLP_COOKIES_PATH ?? "/etc/secrets/youtube_cookies.txt";
-
-// เลือก m4a ก่อน เพื่อลดปัญหา webm/opus
-const YTDLP_FORMAT =
-    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp4]/bestaudio/best";
-
 type Track = {
     url: string;
     title: string;
@@ -70,12 +64,11 @@ type GuildMusicState = {
     queue: Track[];
     playing?: Track;
 
+    // running stuff (for cleanup on skip/stop)
     currentFfmpeg?: ChildProcessWithoutNullStreams;
-
-    statusChannel?: TextBasedChannel;
-    statusMessage?: DjsMessage; // ✅ เปลี่ยนเป็น message object
-    isStarting?: boolean;
 };
+
+
 const musicStates = new Map<string, GuildMusicState>();
 
 const client = new Client({
@@ -125,30 +118,17 @@ function getOrCreateState(guildId: string, connection: VoiceConnection): GuildMu
 
     const state: GuildMusicState = { connection, player, queue: [] };
 
-    player.on(AudioPlayerStatus.Buffering, () => {
-        console.log(`[voice] Buffering (guild=${guildId})`);
-        void updateStatus(state, "กำลัง Buffering… ⏳");
-    });
-
-    player.on(AudioPlayerStatus.Playing, () => {
-        console.log(`[voice] Playing (guild=${guildId})`);
-        const title = state.playing?.title ?? "เพลง";
-        void updateStatus(state, `กำลังเล่น: **${title}** 🎵`);
-    });
-
     player.on(AudioPlayerStatus.Idle, () => {
-        console.log(`[voice] Idle (guild=${guildId})`);
         state.playing = undefined;
-        void cleanupNow(state);
-        void playNext(guildId);
+        cleanupNow(state).catch(console.error);
+        playNext(guildId).catch(console.error);
     });
 
     player.on("error", (err) => {
         console.error("AudioPlayer error:", err);
         state.playing = undefined;
-        void updateStatus(state, `เล่นไม่สำเร็จ: ${String((err as any)?.message ?? err)} ❌`);
-        void cleanupNow(state);
-        void playNext(guildId);
+        cleanupNow(state).catch(console.error);
+        playNext(guildId).catch(console.error);
     });
 
     musicStates.set(guildId, state);
@@ -177,91 +157,27 @@ async function resolveTrack(query: string, requestedBy: string): Promise<Track> 
     };
 }
 
-async function updateStatus(state: GuildMusicState, content: string) {
-    const ch = state.statusChannel;
-    if (!ch) return;
+// ✅ (Render-friendly) บังคับเลือก m4a ก่อน แล้วใช้ -g เอา direct URL
+const YTDLP_FORMAT =
+    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp4]/bestaudio/best";
 
-    try {
-        if (state.statusMessage) {
-            // ✅ ไม่ fetch แล้ว แก้ที่ต้นเหตุ ABORT_ERR
-            await state.statusMessage.edit(content);
-            return;
-        }
-
-        const sent = await ch.send(content);
-        state.statusMessage = sent as any; // TextBasedChannel type จะกว้างหน่อย
-    } catch (e: any) {
-        const msg = String(e?.name ?? e?.message ?? e);
-        console.error("updateStatus failed:", e);
-
-        // ✅ ถ้า abort/หา message ไม่เจอ/ไม่มีสิทธิ์ -> ส่งใหม่
-        if (msg.includes("AbortError") || msg.includes("ABORT_ERR")) {
-            state.statusMessage = undefined;
-            try {
-                const sent = await ch.send(content);
-                state.statusMessage = sent as any;
-            } catch (e2) {
-                console.error("updateStatus retry failed:", e2);
-            }
-            return;
-        }
-
-        // เผื่อ message หาย/แก้ไม่ได้
-        state.statusMessage = undefined;
-    }
-}
-
-// ---------- yt-dlp direct url with timeout + cookies ----------
 function getYtDlpDirectUrl(youtubeUrl: string): Promise<string> {
     return new Promise((resolve, reject) => {
-        const args = ["--no-playlist", "-f", YTDLP_FORMAT];
-
-        // แนบ cookies ถ้ามี (Render secret file)
-        // หมายเหตุ: ถ้าไฟล์ไม่มีจริง yt-dlp จะ error เราจะเห็นใน stderr
-        if (YTDLP_COOKIES_PATH) {
-            args.push("--cookies", YTDLP_COOKIES_PATH);
-        }
-
-        // -g print direct URL
-        args.push("-g", youtubeUrl);
-
-        const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+        const p = spawn(
+            "yt-dlp",
+            ["--no-playlist", "-f", YTDLP_FORMAT, "-g", youtubeUrl],
+            { stdio: ["ignore", "pipe", "pipe"] }
+        );
 
         let out = "";
         let err = "";
 
-        const timeout = setTimeout(() => {
-            try {
-                p.kill("SIGKILL");
-            } catch { }
-            reject(new Error("yt-dlp timeout (25s)"));
-        }, 25_000);
-
         p.stdout?.on("data", (d) => (out += d.toString()));
         p.stderr?.on("data", (d) => (err += d.toString()));
-        p.on("error", (e) => {
-            clearTimeout(timeout);
-            reject(e);
-        });
 
+        p.on("error", reject);
         p.on("close", (code) => {
-            clearTimeout(timeout);
-
-            if (code !== 0) {
-                // ทำให้ error อ่านง่าย
-                const cleaned = err.trim();
-
-                // YouTube bot-check
-                if (cleaned.includes("Sign in to confirm you’re not a bot")) {
-                    return reject(
-                        new Error(
-                            "YouTube บล็อก (ต้องใช้ cookies): ใส่ Secret File youtube_cookies.txt แล้วตั้ง YTDLP_COOKIES_PATH"
-                        )
-                    );
-                }
-
-                return reject(new Error(`yt-dlp failed (${code}): ${cleaned || "(no stderr)"}`));
-            }
+            if (code !== 0) return reject(new Error(`yt-dlp failed (${code}): ${err}`));
 
             const direct = out
                 .trim()
@@ -276,10 +192,11 @@ function getYtDlpDirectUrl(youtubeUrl: string): Promise<string> {
     });
 }
 
-// ---------- ffmpeg stream with timeout ----------
-async function createYouTubeOggOpusResource(
-    youtubeUrl: string
-): Promise<{ resource: ReturnType<typeof createAudioResource>; ffmpeg: ChildProcessWithoutNullStreams }> {
+// ✅ สตรีมทันที: yt-dlp -g -> ffmpeg อ่าน URL -> ogg/opus -> discord
+async function createYouTubeOggOpusResource(youtubeUrl: string): Promise<{
+    resource: ReturnType<typeof createAudioResource>;
+    ffmpeg: ChildProcessWithoutNullStreams;
+}> {
     const directUrl = await getYtDlpDirectUrl(youtubeUrl);
 
     const ffmpeg = spawn(
@@ -318,21 +235,11 @@ async function createYouTubeOggOpusResource(
     );
 
     ffmpeg.stderr?.on("data", (d) => console.error("[ffmpeg]", d.toString()));
-
-    // ถ้า 20 วิยังไม่ยอมมี output แปลว่า ffmpeg ค้าง/โดนบล็อก
-    const killTimer = setTimeout(() => {
-        try {
-            ffmpeg.kill("SIGKILL");
-        } catch { }
-    }, 20_000);
-
     ffmpeg.on("exit", (code) => {
-        clearTimeout(killTimer);
         if (code !== 0) console.error(`[ffmpeg] exited with code ${code}`);
     });
 
     if (!ffmpeg.stdout) {
-        clearTimeout(killTimer);
         ffmpeg.kill("SIGKILL");
         throw new Error("ffmpeg stdout is null (spawn stdio not piped)");
     }
@@ -348,49 +255,27 @@ async function cleanupNow(state: GuildMusicState) {
         state.currentFfmpeg?.kill("SIGKILL");
     } catch { }
     state.currentFfmpeg = undefined;
-    state.isStarting = false;
 }
 
 async function playNext(guildId: string) {
     const state = musicStates.get(guildId);
     if (!state) return;
 
-    // กัน playNext ซ้อน (เช่น Idle ซ้อน/stop ซ้อน)
-    if (state.isStarting) return;
-    state.isStarting = true;
-
     const next = state.queue.shift();
-    if (!next) {
-        state.isStarting = false;
-        await updateStatus(state, "คิวว่าง ✅");
-        return;
-    }
+    if (!next) return;
 
     state.playing = next;
+
     await cleanupNow(state);
 
     try {
-        await updateStatus(state, `กำลังดึงข้อมูลเพลง: **${next.title}** …`);
-        await updateStatus(state, "ขอ direct URL จาก YouTube…");
-
         const { resource, ffmpeg } = await createYouTubeOggOpusResource(next.url);
-
         state.currentFfmpeg = ffmpeg;
-
-        await updateStatus(state, "เริ่มส่งเสียงเข้า Discord…");
         state.player.play(resource);
-
-        // ไม่ set isStarting=false ที่นี่ เพราะ Idle/Playing จะเป็นตัวจัดการต่อ
-        state.isStarting = false;
-    } catch (e: any) {
+    } catch (e) {
         console.error("playNext failed:", e);
-        const msg = String(e?.message ?? e);
-
-        await updateStatus(state, `เล่นไม่สำเร็จ: ${msg} ❌`);
         state.playing = undefined;
         await cleanupNow(state);
-
-        // ข้ามไปเพลงถัดไป
         return playNext(guildId);
     }
 }
@@ -449,17 +334,13 @@ client.on("messageCreate", async (message: Message) => {
             const connection = await ensureConnected(member);
             const state = getOrCreateState(message.guild.id, connection);
 
-            // ตั้ง channel สำหรับ report status
-            state.statusChannel = message.channel;
-            state.statusMessage = undefined; // รีเซ็ตให้ edit เป็นก้อนใหม่ในรอบนี้
-
             const track = await resolveTrack(args, message.author.username);
             state.queue.push(track);
 
+            // ✅ แจ้งว่า "กำลังเริ่มเล่น" (สตรีมจะเริ่มไวกว่าแบบโหลดไฟล์)
             if (state.player.state.status !== AudioPlayerStatus.Playing && !state.playing) {
-                await updateStatus(state, `รับคำสั่งแล้ว ✅ กำลังเตรียม: **${track.title}** ⏳`);
                 await playNext(message.guild.id);
-                return;
+                return message.reply(`กำลังเริ่มเล่น: **${track.title}** 🎵`);
             }
 
             return message.reply(`เพิ่มเข้าคิวแล้ว: **${track.title}**`);
@@ -468,7 +349,6 @@ client.on("messageCreate", async (message: Message) => {
         if (cmd === "skip") {
             const state = musicStates.get(message.guild.id);
             if (!state) return message.reply("ยังไม่มีเพลงกำลังเล่น");
-
             state.player.stop(true); // trigger Idle -> cleanup -> playNext
             return message.reply("ข้ามเพลงแล้ว ⏭️");
         }
@@ -476,14 +356,11 @@ client.on("messageCreate", async (message: Message) => {
         if (cmd === "stop") {
             const state = musicStates.get(message.guild.id);
             if (!state) return message.reply("ยังไม่มีเพลงกำลังเล่น");
-
             state.queue = [];
             state.playing = undefined;
             state.player.stop(true);
             await cleanupNow(state);
-            await updateStatus(state, "หยุดเพลงและล้างคิวแล้ว 🛑");
-
-            return;
+            return message.reply("หยุดเพลงและล้างคิวแล้ว 🛑");
         }
 
         if (cmd === "queue") {
