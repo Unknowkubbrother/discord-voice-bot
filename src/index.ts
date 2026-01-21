@@ -7,7 +7,6 @@ process.on("warning", (w) => {
     console.warn(w);
 });
 
-
 // กัน Render free sleep: ต้องมี inbound traffic
 const port = Number(process.env.PORT ?? 3000);
 
@@ -47,9 +46,6 @@ import {
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import * as os from "node:os";
 import ytSearch from "yt-search";
 
 const PREFIX = "!";
@@ -70,7 +66,6 @@ type GuildMusicState = {
 
     // running stuff (for cleanup on skip/stop)
     currentFfmpeg?: ChildProcessWithoutNullStreams;
-    currentFile?: string;
 };
 
 const musicStates = new Map<string, GuildMusicState>();
@@ -124,7 +119,6 @@ function getOrCreateState(guildId: string, connection: VoiceConnection): GuildMu
 
     player.on(AudioPlayerStatus.Idle, () => {
         state.playing = undefined;
-        // cleanup current track resources
         cleanupNow(state).catch(console.error);
         playNext(guildId).catch(console.error);
     });
@@ -142,7 +136,6 @@ function getOrCreateState(guildId: string, connection: VoiceConnection): GuildMu
 
 async function resolveTrack(query: string, requestedBy: string): Promise<Track> {
     if (isYouTubeUrl(query)) {
-        // ดึง title ให้สวยขึ้น (optional)
         try {
             const res = await ytSearch(query);
             const v = res.videos?.[0];
@@ -155,6 +148,7 @@ async function resolveTrack(query: string, requestedBy: string): Promise<Track> 
     const res = await ytSearch(query);
     const video = res.videos?.[0];
     if (!video?.url) throw new Error("หาเพลงไม่เจอ ลองคำอื่นดู");
+
     return {
         url: video.url,
         title: video.title ?? "Unknown title",
@@ -162,51 +156,67 @@ async function resolveTrack(query: string, requestedBy: string): Promise<Track> 
     };
 }
 
-// เลือก m4a ก่อน เพื่อตัดปัญหา opus/webm แปลกๆ
+// ✅ (Render-friendly) บังคับเลือก m4a ก่อน แล้วใช้ -g เอา direct URL
 const YTDLP_FORMAT =
     "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp4]/bestaudio/best";
 
-async function downloadToTempM4A(youtubeUrl: string, tag: string): Promise<string> {
-    const tmpDir = path.join(os.tmpdir(), "discord-voice-bot");
-    await fs.mkdir(tmpDir, { recursive: true });
-
-    const outFile = path.join(tmpDir, `${tag}-${Date.now()}.m4a`);
-
-    await new Promise<void>((resolve, reject) => {
+function getYtDlpDirectUrl(youtubeUrl: string): Promise<string> {
+    return new Promise((resolve, reject) => {
         const p = spawn(
             "yt-dlp",
-            [
-                "--no-playlist",
-                "-f",
-                YTDLP_FORMAT,
-                "-o",
-                outFile,
-                youtubeUrl,
-            ],
+            ["--no-playlist", "-f", YTDLP_FORMAT, "-g", youtubeUrl],
             { stdio: ["ignore", "pipe", "pipe"] }
         );
 
+        let out = "";
         let err = "";
+
+        p.stdout?.on("data", (d) => (out += d.toString()));
         p.stderr?.on("data", (d) => (err += d.toString()));
+
         p.on("error", reject);
         p.on("close", (code) => {
             if (code !== 0) return reject(new Error(`yt-dlp failed (${code}): ${err}`));
-            resolve();
+
+            const direct = out
+                .trim()
+                .split("\n")
+                .map((s) => s.trim())
+                .filter(Boolean)
+                .pop();
+
+            if (!direct) return reject(new Error(`yt-dlp returned empty url: ${err}`));
+            resolve(direct);
         });
     });
-
-    return outFile;
 }
 
-function spawnFfmpegOggOpusFromFile(inputFile: string): ChildProcessWithoutNullStreams {
-    const p = spawn(
+// ✅ สตรีมทันที: yt-dlp -g -> ffmpeg อ่าน URL -> ogg/opus -> discord
+async function createYouTubeOggOpusResource(youtubeUrl: string): Promise<{
+    resource: ReturnType<typeof createAudioResource>;
+    ffmpeg: ChildProcessWithoutNullStreams;
+}> {
+    const directUrl = await getYtDlpDirectUrl(youtubeUrl);
+
+    const ffmpeg = spawn(
         "ffmpeg",
         [
             "-hide_banner",
             "-loglevel",
             "warning",
+
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+
+            "-user_agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+
             "-i",
-            inputFile,
+            directUrl,
             "-vn",
             "-acodec",
             "libopus",
@@ -223,28 +233,27 @@ function spawnFfmpegOggOpusFromFile(inputFile: string): ChildProcessWithoutNullS
         { stdio: ["ignore", "pipe", "pipe"] }
     );
 
-    p.stderr?.on("data", (d) => console.error("[ffmpeg]", d.toString()));
-    p.on("exit", (code) => {
+    ffmpeg.stderr?.on("data", (d) => console.error("[ffmpeg]", d.toString()));
+    ffmpeg.on("exit", (code) => {
         if (code !== 0) console.error(`[ffmpeg] exited with code ${code}`);
     });
 
-    return p;
+    if (!ffmpeg.stdout) {
+        ffmpeg.kill("SIGKILL");
+        throw new Error("ffmpeg stdout is null (spawn stdio not piped)");
+    }
+
+    const stream = ffmpeg.stdout as unknown as Readable;
+    const resource = createAudioResource(stream, { inputType: StreamType.OggOpus });
+
+    return { resource, ffmpeg };
 }
 
 async function cleanupNow(state: GuildMusicState) {
-    // kill ffmpeg (ถ้ามี)
     try {
         state.currentFfmpeg?.kill("SIGKILL");
     } catch { }
     state.currentFfmpeg = undefined;
-
-    // delete temp file (ถ้ามี)
-    if (state.currentFile) {
-        try {
-            await fs.unlink(state.currentFile);
-        } catch { }
-        state.currentFile = undefined;
-    }
 }
 
 async function playNext(guildId: string) {
@@ -256,26 +265,17 @@ async function playNext(guildId: string) {
 
     state.playing = next;
 
-    // cleanup ของเดิมเผื่อค้าง
     await cleanupNow(state);
 
     try {
-        // ✅ download -> ffmpeg -> resource (นิ่งสุด)
-        const file = await downloadToTempM4A(next.url, guildId);
-        state.currentFile = file;
-
-        const ffmpeg = spawnFfmpegOggOpusFromFile(file);
+        const { resource, ffmpeg } = await createYouTubeOggOpusResource(next.url);
         state.currentFfmpeg = ffmpeg;
-
-        const stream = ffmpeg.stdout as unknown as Readable;
-        const resource = createAudioResource(stream, { inputType: StreamType.OggOpus });
-
         state.player.play(resource);
     } catch (e) {
         console.error("playNext failed:", e);
         state.playing = undefined;
         await cleanupNow(state);
-        return playNext(guildId); // ข้ามไปเพลงถัดไปถ้ามี
+        return playNext(guildId);
     }
 }
 
@@ -336,9 +336,10 @@ client.on("messageCreate", async (message: Message) => {
             const track = await resolveTrack(args, message.author.username);
             state.queue.push(track);
 
+            // ✅ แจ้งว่า "กำลังเริ่มเล่น" (สตรีมจะเริ่มไวกว่าแบบโหลดไฟล์)
             if (state.player.state.status !== AudioPlayerStatus.Playing && !state.playing) {
                 await playNext(message.guild.id);
-                return message.reply(`กำลังเตรียมเล่น: **${track.title}** 🎵`);
+                return message.reply(`กำลังเริ่มเล่น: **${track.title}** 🎵`);
             }
 
             return message.reply(`เพิ่มเข้าคิวแล้ว: **${track.title}**`);
@@ -347,7 +348,7 @@ client.on("messageCreate", async (message: Message) => {
         if (cmd === "skip") {
             const state = musicStates.get(message.guild.id);
             if (!state) return message.reply("ยังไม่มีเพลงกำลังเล่น");
-            state.player.stop(true); // จะ trigger Idle -> cleanup -> playNext
+            state.player.stop(true); // trigger Idle -> cleanup -> playNext
             return message.reply("ข้ามเพลงแล้ว ⏭️");
         }
 
@@ -380,10 +381,10 @@ client.on("messageCreate", async (message: Message) => {
         console.error(err);
         try {
             const msg = String(err?.message ?? "");
-            if (msg.includes("spawn yt-dlp")) {
-                await message.reply("หา `yt-dlp` ไม่เจอ — ติดตั้งด้วย `brew install yt-dlp`");
-            } else if (msg.includes("spawn ffmpeg")) {
-                await message.reply("หา `ffmpeg` ไม่เจอ — ติดตั้งด้วย `brew install ffmpeg`");
+            if (msg.includes("yt-dlp")) {
+                await message.reply("ฝั่งเซิร์ฟเวอร์หา `yt-dlp` ไม่เจอ (เช็ค Dockerfile ว่าติดตั้งแล้ว)");
+            } else if (msg.includes("ffmpeg")) {
+                await message.reply("ฝั่งเซิร์ฟเวอร์หา `ffmpeg` ไม่เจอ (เช็ค Dockerfile ว่าติดตั้งแล้ว)");
             } else {
                 await message.reply(`เกิดข้อผิดพลาด: ${err?.message ?? "unknown"}`);
             }
