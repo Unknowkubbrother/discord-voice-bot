@@ -68,8 +68,6 @@ type GuildMusicState = {
     currentFfmpeg?: ChildProcessWithoutNullStreams;
 };
 
-const YTDLP_COOKIES_PATH =
-    process.env.YTDLP_COOKIES_PATH ?? "/etc/secrets/youtube_cookies.txt";
 
 const musicStates = new Map<string, GuildMusicState>();
 
@@ -165,17 +163,11 @@ const YTDLP_FORMAT =
 
 function getYtDlpDirectUrl(youtubeUrl: string): Promise<string> {
     return new Promise((resolve, reject) => {
-        const args = ["--no-playlist", "-f", YTDLP_FORMAT];
-
-        // ถ้ามี cookies ให้แนบไปด้วย (แก้ Sign in to confirm you're not a bot)
-        if (YTDLP_COOKIES_PATH) {
-            args.push("--cookies", YTDLP_COOKIES_PATH);
-        }
-
-        // -g = print direct media URL
-        args.push("-g", youtubeUrl);
-
-        const p = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+        const p = spawn(
+            "yt-dlp",
+            ["--no-playlist", "-f", YTDLP_FORMAT, "-g", youtubeUrl],
+            { stdio: ["ignore", "pipe", "pipe"] }
+        );
 
         let out = "";
         let err = "";
@@ -199,7 +191,6 @@ function getYtDlpDirectUrl(youtubeUrl: string): Promise<string> {
         });
     });
 }
-
 
 // ✅ สตรีมทันที: yt-dlp -g -> ffmpeg อ่าน URL -> ogg/opus -> discord
 async function createYouTubeOggOpusResource(youtubeUrl: string): Promise<{
