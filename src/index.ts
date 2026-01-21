@@ -1,11 +1,31 @@
 // src/index.ts
+
+import "dotenv/config";
+
 process.on("warning", (w) => {
     if (w?.name === "TimeoutNegativeWarning") return;
     console.warn(w);
 });
 
 
-import "dotenv/config";
+// กัน Render free sleep: ต้องมี inbound traffic
+const port = Number(process.env.PORT ?? 3000);
+
+Bun.serve({
+    port,
+    fetch(req) {
+        const url = new URL(req.url);
+
+        if (url.pathname === "/health") {
+            return new Response("ok", { status: 200 });
+        }
+
+        return new Response("discord bot running", { status: 200 });
+    },
+});
+
+console.log(`[web] listening on :${port}`);
+
 import {
     Client,
     GatewayIntentBits,
