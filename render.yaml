@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: discord-voice-bot
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
